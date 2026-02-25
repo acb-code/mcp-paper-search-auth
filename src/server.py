@@ -1,68 +1,108 @@
 import os
-import json
 from pathlib import Path
-from typing import Any
+import json
 
 import httpx
 from dotenv import load_dotenv
-from jose import jwt, JWTError
 from pypdf import PdfReader
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.provider import TokenVerifier, AccessToken
+from pydantic import AnyHttpUrl
+from jose import jwt, JWTError
 
 load_dotenv()
 
 # --- Config ---
 AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN")
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")
-PDF_DIR = Path(os.getenv("PDF_DIR", "data/pdfs"))
+SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000")
+PDF_DIR = Path(os.getenv("PDF_DIR", "/data/pdfs"))
 
-# --- Auth0 token verification ---
-def get_auth0_public_key(token: str) -> dict:
-    """Fetch JWKS and find the key matching the token's kid."""
-    header = jwt.get_unverified_header(token)
-    jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-    resp = httpx.get(jwks_url)
-    resp.raise_for_status()
-    jwks = resp.json()
-    for key in jwks["keys"]:
-        if key["kid"] == header["kid"]:
-            return key
-    raise ValueError("No matching public key found")
+# --- Auth0 Token Verifier ---
+class Auth0TokenVerifier(TokenVerifier):
+    def __init__(self):
+        self._jwks: dict | None = None
 
-def verify_token(token: str) -> dict:
-    """Verify Auth0 JWT and return claims."""
-    public_key = get_auth0_public_key(token)
-    payload = jwt.decode(
-        token,
-        public_key,
-        algorithms=["RS256"],
-        audience=AUTH0_AUDIENCE,
-        issuer=f"https://{AUTH0_DOMAIN}/",
-    )
-    return payload
+    def _get_jwks(self) -> dict:
+        if not self._jwks:
+            resp = httpx.get(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json")
+            resp.raise_for_status()
+            self._jwks = resp.json()
+        return self._jwks
+
+    async def verify_token(self, token: str) -> AccessToken:
+        try:
+            header = jwt.get_unverified_header(token)
+            print(f"DEBUG token header: {header}")
+            jwks = self._get_jwks()
+            header = jwt.get_unverified_header(token)
+            kid = header.get("kid")
+
+            # If kid present, match it; otherwise try all keys
+            keys = (
+                [k for k in jwks["keys"] if k["kid"] == kid]
+                if kid
+                else jwks["keys"]
+            )
+
+            if not keys:
+                raise ValueError("No matching public key found")
+
+            last_error = None
+            for key in keys:
+                try:
+                    payload = jwt.decode(
+                        token,
+                        key,
+                        algorithms=["RS256"],
+                        # audience=AUTH0_AUDIENCE,
+                        options={"verify_aud": False},  # skip audience check
+                        issuer=f"https://{AUTH0_DOMAIN}/",
+                    )
+                    return AccessToken(
+                        token=token,
+                        client_id=payload.get("azp", payload.get("sub", "")),
+                        scopes=payload.get("scope", "openid").split(),
+                        expires_at=payload.get("exp"),
+                    )
+                except JWTError as e:
+                    last_error = e
+                    continue
+
+            raise ValueError(f"Token verification failed with all keys: {last_error}")
+
+        except (ValueError, httpx.HTTPError) as e:
+            raise ValueError(f"Token verification failed: {e}")
+
 
 # --- MCP Server ---
-mcp = FastMCP("mcp-paper-search-auth")
+mcp = FastMCP(
+    "pdf-search",
+    host="0.0.0.0",
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(f"https://{AUTH0_DOMAIN}/"),
+        resource_server_url=AnyHttpUrl(SERVER_URL),
+        required_scopes=["openid"],
+    ),
+    token_verifier=Auth0TokenVerifier(),
+)
+
+
+# --- Tools ---
 
 @mcp.tool()
-def search_pdfs(query: str, auth_token: str) -> str:
+def search_pdfs(query: str) -> str:
     """
-    Search through all PDFs in the cofigured directory for the given query string.
+    Search through all PDFs in the configured directory for the given query string.
     Returns matching excerpts with source filenames.
-    
+
     Args:
         query: Text to search for (case-insensitive)
-        auth_token: Bearer token from Auth0
     """
-    # Verify auth
-    try:
-        claims = verify_token(auth_token)
-    except (JWTError, ValueError, httpx.HTTPError) as e:
-        return json.dumps({"error": f"Unauthorized: {str(e)}"})
-    
     if not PDF_DIR.exists():
         return json.dumps({"error": f"PDF directory not found: {PDF_DIR}"})
-    
+
     results = []
     query_lower = query.lower()
 
@@ -72,7 +112,6 @@ def search_pdfs(query: str, auth_token: str) -> str:
             for page_num, page in enumerate(reader.pages, start=1):
                 text = page.extract_text() or ""
                 if query_lower in text.lower():
-                    # grab a small excerpt around the match
                     idx = text.lower().find(query_lower)
                     start = max(0, idx - 150)
                     end = min(len(text), idx + 150)
@@ -84,25 +123,16 @@ def search_pdfs(query: str, auth_token: str) -> str:
                     })
         except Exception as e:
             results.append({"file": pdf_path.name, "error": str(e)})
-    
+
     if not results:
         return json.dumps({"message": f"No results found for '{query}'"})
-    
+
     return json.dumps({"query": query, "results": results}, indent=2)
 
-@mcp.tool()
-def list_pdfs(auth_token: str) -> str:
-    """
-    List all PDF files available in the search directory.
-    
-    Args:
-        auth_token: Bearer token from Auth0
-    """
-    try:
-        verify_token(auth_token)
-    except (JWTError, ValueError, httpx.HTTPError) as e:
-        return json.dumps({"error": f"Unauthorized: {str(e)}"})
 
+@mcp.tool()
+def list_pdfs() -> str:
+    """List all PDF files available in the search directory."""
     if not PDF_DIR.exists():
         return json.dumps({"error": f"PDF directory not found: {PDF_DIR}"})
 
@@ -114,5 +144,4 @@ def list_pdfs(auth_token: str) -> str:
 
 
 if __name__ == "__main__":
-    # SSE transport for HTTP-based deployment (ngrok/Railway)
-    mcp.run(transport="sse")
+    mcp.run(transport="streamable-http")

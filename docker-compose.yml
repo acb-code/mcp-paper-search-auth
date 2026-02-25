@@ -6,6 +6,7 @@ services:
     environment:
       - AUTH0_DOMAIN=${AUTH0_DOMAIN}
       - AUTH0_AUDIENCE=${AUTH0_AUDIENCE}
+      - SERVER_URL=${SERVER_URL}
       - PDF_DIR=/data/pdfs
       - HOST=0.0.0.0
       - PORT=8000
