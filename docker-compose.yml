@@ -1,0 +1,14 @@
+services:
+  mcp-paper-search-auth:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - AUTH0_DOMAIN=${AUTH0_DOMAIN}
+      - AUTH0_AUDIENCE=${AUTH0_AUDIENCE}
+      - PDF_DIR=/data/pdfs
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - ./data/pdfs:/data/pdfs
+    restart: unless-stopped
